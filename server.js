@@ -22,7 +22,7 @@ app.get('/create-room', (req, res) => {
   // Получаем порт сервера (по умолчанию 3000)
   const port = server.address().port || 3000;
   // Генерируем roomId с http
-  const httpRoomId = `http://${roomId}`;
+  const httpRoomId = `http${roomId}`;
   // Генерируем полный url комнаты
   const url = `http://localhost:${port}/room/${roomId}`;
   res.json({ roomId: httpRoomId, url });
