@@ -8,7 +8,7 @@ function Home() {
 
   const createRoom = async () => {
     setLoading(true);
-    const res = await fetch('http://localhost:3001/create-room');
+    const res = await fetch('https://video-call-server-dxkq.onrender.com/create-room');
     const data = await res.json();
     navigate(`/room/${data.roomId}`);
   };

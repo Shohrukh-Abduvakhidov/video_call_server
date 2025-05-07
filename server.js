@@ -19,7 +19,13 @@ app.use(express.json());
 // Генерация уникальной комнаты
 app.get('/create-room', (req, res) => {
   const roomId = uuidv4();
-  res.json({ roomId, url: `/room/${roomId}` });
+  // Получаем порт сервера (по умолчанию 3000)
+  const port = server.address().port || 3000;
+  // Генерируем roomId с http
+  const httpRoomId = `http://${roomId}`;
+  // Генерируем полный url комнаты
+  const url = `http://localhost:${port}/room/${roomId}`;
+  res.json({ roomId: httpRoomId, url });
 });
 
 // (Маршрут для фронта, не обязательно отдаёт страницу)
