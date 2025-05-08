@@ -2,133 +2,235 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import io from 'socket.io-client';
 
-const SERVER_URL = 'https://video-call-server-dxkq.onrender.com';
+const SERVER_URL = 'http://localhost:3001';
 const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
 
 function Room() {
   const { roomId } = useParams();
   const navigate = useNavigate();
-  const [peers, setPeers] = useState({}); // userId -> stream
+  const [peers, setPeers] = useState({});
   const [myId, setMyId] = useState(null);
   const [users, setUsers] = useState([]);
   const [isCameraOn, setIsCameraOn] = useState(true);
   const [isMicOn, setIsMicOn] = useState(true);
   const socketRef = useRef();
-  const peersRef = useRef({}); // userId -> RTCPeerConnection
+  const peersRef = useRef({});
   const localVideoRef = useRef();
   const localStreamRef = useRef();
 
   const handleLeave = () => {
-    // Оповестить сервер
     if (socketRef.current) {
       socketRef.current.emit('leave-room');
       socketRef.current.disconnect();
     }
-    // Остановить все peer соединения
     Object.values(peersRef.current).forEach(peer => peer.close());
-    // Остановить локальный стрим
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => track.stop());
     }
-    // Очистить состояние
     setPeers({});
     setUsers([]);
-    // Перейти на главную
     navigate('/');
   };
 
   useEffect(() => {
     socketRef.current = io(SERVER_URL);
-    navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-      .then(stream => {
-        localVideoRef.current.srcObject = stream;
-        localStreamRef.current = stream;
 
-        socketRef.current.emit('join-room', roomId, socketRef.current.id);
-        setMyId(socketRef.current.id);
+    socketRef.current.on('connect', () => {
+      setMyId(socketRef.current.id);
+      console.log('[client] socketRef.current.id:', socketRef.current.id);
+      navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+        .then(stream => {
+          localVideoRef.current.srcObject = stream;
+          localStreamRef.current = stream;
 
-        socketRef.current.on('all-users', (userIds) => {
-          setUsers(userIds);
-          userIds.forEach(userId => {
-            callUser(userId, stream);
+          // userId всегда равен socketRef.current.id!
+          socketRef.current.emit('join-room', { roomId, userId: socketRef.current.id });
+
+          socketRef.current.on('all-users', (userIds) => {
+            console.log('[all-users]', userIds);
+            const validUserIds = userIds.filter(id => typeof id === 'string' && id);
+            setUsers(validUserIds);
+            validUserIds.forEach(userId => {
+              if (userId !== socketRef.current.id && !peersRef.current[userId]) {
+                console.log('[all-users] callUser для', userId);
+                callUser(userId, stream);
+              }
+            });
+          });
+
+          socketRef.current.on('user-joined', (userId) => {
+            console.log('[user-joined]', userId);
+            if (!userId || typeof userId !== 'string') return;
+            setUsers(prev => [...prev, userId]);
+            if (userId !== socketRef.current.id && !peersRef.current[userId]) {
+              console.log('[user-joined] callUser для', userId);
+              callUser(userId, stream);
+            }
+          });
+
+          socketRef.current.on('offer', async ({ from, offer }) => {
+            if (!from || typeof from !== 'string') return;
+            let peer = peersRef.current[from];
+            if (!peer) {
+              peer = createPeer(from, false, stream);
+            }
+            console.log('[offer] от', from, offer, 'peer.signalingState:', peer.signalingState);
+            // Не отвечаем, если peer уже в stable (уже был answer)
+            if (peer.signalingState !== 'stable') {
+              try {
+                await peer.setRemoteDescription(new RTCSessionDescription(offer));
+              } catch (err) {
+                console.warn('[offer] setRemoteDescription(offer) error:', err, 'peer.signalingState:', peer.signalingState);
+              }
+              // Создаём answer только если peer в состоянии have-remote-offer
+              if (peer.signalingState === 'have-remote-offer') {
+                const answer = await peer.createAnswer();
+                try {
+                  await peer.setLocalDescription(answer);
+                } catch (err) {
+                  console.warn('[offer] setLocalDescription(answer) error:', err, 'peer.signalingState:', peer.signalingState);
+                }
+                socketRef.current.emit('answer', { to: from, answer });
+                console.log('[answer] setLocalDescription, signalingState:', peer.signalingState);
+              } else {
+                console.warn('[offer] Пропущен createAnswer, peer.signalingState:', peer.signalingState);
+              }
+            } else {
+              console.warn('[offer] Пропущен setLocalDescription(answer), peer уже в stable');
+            }
+          });
+
+          socketRef.current.on('answer', async ({ from, answer }) => {
+            const peer = peersRef.current[from];
+            if (!peer) return;
+            console.log('[answer] от', from, answer, 'peer.signalingState:', peer.signalingState);
+            // Только если peer в состоянии "have-local-offer" можно применять answer
+            if (peer.signalingState === 'have-local-offer') {
+              try {
+                try {
+                  await peer.setRemoteDescription(new RTCSessionDescription(answer));
+                } catch (err) {
+                  console.warn('[answer] setRemoteDescription error:', err, 'peer.signalingState:', peer.signalingState);
+                }
+              } catch (err) {
+                console.warn('[answer] setRemoteDescription error:', err);
+              }
+            } else {
+              console.warn('[answer] Пропущен setRemoteDescription(answer), peer.signalingState:', peer.signalingState);
+            }
+          });
+
+          socketRef.current.on('ice-candidate', ({ from, candidate }) => {
+            console.log('[ice-candidate] от', from, candidate);
+            const peer = peersRef.current[from];
+            if (peer && candidate) {
+              peer.addIceCandidate(new RTCIceCandidate(candidate));
+            }
+          });
+
+          socketRef.current.on('user-left', (userId) => {
+            console.log('[user-left]', userId);
+            if (peersRef.current[userId]) {
+              peersRef.current[userId].close();
+              delete peersRef.current[userId];
+              setPeers(prev => {
+                const copy = { ...prev };
+                delete copy[userId];
+                console.log('[user-left] peers:', copy);
+                return copy;
+              });
+            }
+            setUsers(prev => prev.filter(id => id !== userId));
           });
         });
-
-        socketRef.current.on('user-joined', (userId) => {
-          setUsers(prev => [...prev, userId]);
-        });
-
-        socketRef.current.on('offer', async ({ from, offer }) => {
-          const peer = createPeer(from, false, stream);
-          await peer.setRemoteDescription(new RTCSessionDescription(offer));
-          const answer = await peer.createAnswer();
-          await peer.setLocalDescription(answer);
-          socketRef.current.emit('answer', { to: from, answer });
-        });
-
-        socketRef.current.on('answer', async ({ from, answer }) => {
-          const peer = peersRef.current[from];
-          if (peer) {
-            await peer.setRemoteDescription(new RTCSessionDescription(answer));
-          }
-        });
-
-        socketRef.current.on('ice-candidate', ({ from, candidate }) => {
-          const peer = peersRef.current[from];
-          if (peer && candidate) {
-            peer.addIceCandidate(new RTCIceCandidate(candidate));
-          }
-        });
-
-        socketRef.current.on('user-left', (userId) => {
-          if (peersRef.current[userId]) {
-            peersRef.current[userId].close();
-            delete peersRef.current[userId];
-            setPeers(prev => {
-              const copy = { ...prev };
-              delete copy[userId];
-              return copy;
-            });
-          }
-          setUsers(prev => prev.filter(id => id !== userId));
-        });
-      });
+    });
 
     return () => {
       socketRef.current.disconnect();
       Object.values(peersRef.current).forEach(peer => peer.close());
     };
-    // eslint-disable-next-line
   }, [roomId]);
 
   function createPeer(userId, isInitiator, stream) {
+    if (peersRef.current[userId]) {
+      peersRef.current[userId].close();
+      delete peersRef.current[userId];
+    }
     const peer = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    stream.getTracks().forEach(track => peer.addTrack(track, stream));
+    peersRef.current[userId] = peer;
 
-    peer.onicecandidate = (e) => {
+    // Только инициатор добавляет свои треки
+    if (isInitiator) {
+      const videoTracks = stream.getVideoTracks();
+      const audioTracks = stream.getAudioTracks();
+      videoTracks.forEach(track => peer.addTrack(track, stream));
+      audioTracks.forEach(track => peer.addTrack(track, stream));
+    }
+
+    peer.onicecandidate = e => {
       if (e.candidate) {
         socketRef.current.emit('ice-candidate', { to: userId, candidate: e.candidate });
       }
     };
-    peer.ontrack = (e) => {
-      setPeers(prev => ({ ...prev, [userId]: e.streams[0] }));
+
+    peer.ontrack = e => {
+      console.log('[ontrack] userId:', userId, 'stream:', e.streams[0]);
+      setPeers(prev => {
+        const updated = { ...prev, [userId]: e.streams[0] };
+        console.log('[setPeers] peers:', updated);
+        return updated;
+      });
     };
+
+
 
     if (isInitiator) {
       peer.onnegotiationneeded = async () => {
-        const offer = await peer.createOffer();
-        await peer.setLocalDescription(offer);
-        socketRef.current.emit('offer', { to: userId, offer });
+        try {
+          const offer = await peer.createOffer();
+          await peer.setLocalDescription(offer);
+          socketRef.current.emit('offer', { to: userId, offer });
+        } catch (err) {
+          console.error('Negotiation error:', err);
+        }
       };
     }
-    peersRef.current[userId] = peer;
+
     return peer;
   }
 
-  function callUser(userId, stream) {
+  async function callUser(userId, stream) {
+    if (userId === socketRef.current.id) return; // не звонить самому себе!
+    console.log('[callUser] вызывается для', userId);
+    const existingPeer = peersRef.current[userId];
+    if (existingPeer) {
+      existingPeer.ontrack = null;
+      existingPeer.onicecandidate = null;
+      existingPeer.onnegotiationneeded = null;
+      existingPeer.close();
+      delete peersRef.current[userId];
+      await new Promise(res => setTimeout(res, 100));
+    }
+
     const peer = createPeer(userId, true, stream);
+    if (!peer) return;
+
+    try {
+      await new Promise(res => setTimeout(res, 50));
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      socketRef.current.emit('offer', { to: userId, offer });
+      console.log('[callUser] отправлен offer для', userId);
+    } catch (err) {
+      console.error('[callUser] offer error:', err);
+    }
   }
 
+  // Логируем всё состояние для отладки
+  console.log('users:', users, 'peers:', peers);
+  users.forEach(userId => {
+    console.log('[render] userId:', userId, 'peers[userId]:', peers[userId]);
+  });
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginTop: 30 }}>
       <h3>Комната: {roomId}</h3>
@@ -164,27 +266,34 @@ function Room() {
             </button>
           </div>
         </div>
-        {users.map(userId => (
-          peers[userId] ? (
-            <div key={userId}>
-              <div style={{ fontWeight: 'bold', marginBottom: 4 }}>{userId.slice(-4)}</div>
+        {users.filter(userId => typeof userId === 'string' && userId).map(userId => (
+          <div key={userId}>
+            <div style={{ fontWeight: 'bold', marginBottom: 4 }}>{userId.slice(-4)}</div>
+            {peers[userId] ? (
               <video
                 autoPlay
                 playsInline
                 ref={video => {
-                  if (video && peers[userId]) video.srcObject = peers[userId];
+                  if (video && peers[userId]) {
+                    const tracks = peers[userId].getTracks ? peers[userId].getTracks() : [];
+                    console.log('[render] video ref для', userId, 'peers[userId]:', peers[userId], 'tracks:', tracks);
+                    video.srcObject = peers[userId];
+                  }
                 }}
                 style={{ width: 240, height: 180, background: '#222' }}
               />
-            </div>
-          ) : null
+            ) : (
+              <div style={{ width: 240, height: 180, background: '#555', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff' }}>
+                Ожидание видео...
+              </div>
+            )}
+          </div>
         ))}
       </div>
-
-      
     </div>
   );
 }
+
 
 
 export default Room;
